@@ -34,6 +34,8 @@ const (
 	_ serverMsgType = iota
 	SRV_MSG_PEER_ADDED
 	SRV_MSG_PEER_DELETED
+	SRV_MSG_PEER_UP
+	SRV_MSG_PEER_SHUTDOWN
 	SRV_MSG_API
 )
 
@@ -56,13 +58,15 @@ type peerMapInfo struct {
 }
 
 type BgpServer struct {
-	bgpConfig     config.BgpType
-	globalTypeCh  chan config.GlobalType
-	addedPeerCh   chan config.NeighborType
-	deletedPeerCh chan config.NeighborType
-	RestReqCh     chan *api.RestRequest
-	listenPort    int
-	peerMap       map[string]peerMapInfo
+	bgpConfig      config.BgpType
+	globalTypeCh   chan config.GlobalType
+	addedPeerCh    chan config.NeighborType
+	deletedPeerCh  chan config.NeighborType
+	RestReqCh      chan *api.RestRequest
+	listenPort     int
+	peerMap        map[string]peerMapInfo
+	disabledPeerCh chan *api.RestRequest
+	enabledPeerCh  chan *api.RestRequest
 }
 
 func NewBgpServer(port int) *BgpServer {
@@ -71,6 +75,8 @@ func NewBgpServer(port int) *BgpServer {
 	b.addedPeerCh = make(chan config.NeighborType)
 	b.deletedPeerCh = make(chan config.NeighborType)
 	b.RestReqCh = make(chan *api.RestRequest, 1)
+	b.enabledPeerCh = make(chan *api.RestRequest, 1)
+	b.disabledPeerCh = make(chan *api.RestRequest, 1)
 	b.listenPort = port
 	return &b
 }
@@ -174,6 +180,7 @@ func (server *BgpServer) Serve() {
 				serverMsgCh: sch,
 				peerMsgData: d,
 			}
+
 		case peer := <-server.deletedPeerCh:
 			addr := peer.NeighborAddress.String()
 			f := listenFile(peer.NeighborAddress)
@@ -190,6 +197,54 @@ func (server *BgpServer) Serve() {
 				sendServerMsgToAll(server.peerMap, msg)
 			} else {
 				log.Info("Can't delete a peer configuration for ", addr)
+			}
+
+		case restReq := <-server.disabledPeerCh:
+			addr := restReq.RemoteAddr
+			info, found := server.peerMap[addr]
+			if found {
+				msg := &serverMsg{
+					msgType: SRV_MSG_PEER_SHUTDOWN,
+					msgData: nil,
+				}
+				info.serverMsgCh <- msg
+
+				result := &api.RestResponse{}
+				p := make(map[string]string)
+				p["result"] = "ok"
+				j, _ := json.Marshal(p)
+				result.Data = j
+				restReq.ResponseCh <- result
+
+			} else {
+				log.WithFields(log.Fields{
+					"Topic": "Peer",
+					"Key":   addr,
+				}).Info("Can't find peer")
+			}
+
+		case restReq := <-server.enabledPeerCh:
+
+			addr := restReq.RemoteAddr
+			info, found := server.peerMap[addr]
+			if found {
+				msg := &serverMsg{
+					msgType: SRV_MSG_PEER_UP,
+					msgData: nil,
+				}
+				info.serverMsgCh <- msg
+				result := &api.RestResponse{}
+				p := make(map[string]string)
+				p["result"] = "ok"
+				j, _ := json.Marshal(p)
+				result.Data = j
+				restReq.ResponseCh <- result
+
+			} else {
+				log.WithFields(log.Fields{
+					"Topic": "Peer",
+					"Key":   addr,
+				}).Info("Can't find peer")
 			}
 		case restReq := <-server.RestReqCh:
 			server.handleRest(restReq)
@@ -256,5 +311,21 @@ func (server *BgpServer) handleRest(restReq *api.RestRequest) {
 			restReq.ResponseCh <- result
 			close(restReq.ResponseCh)
 		}
+	case api.REQ_NEIGHBOR_ENABLE, api.REQ_NEIGHBOR_DISABLE:
+		remoteAddr := restReq.RemoteAddr
+		result := &api.RestResponse{}
+		_, found := server.peerMap[remoteAddr]
+		if found {
+			if restReq.RequestType == api.REQ_NEIGHBOR_ENABLE {
+				server.enabledPeerCh <- restReq
+			} else {
+				server.disabledPeerCh <- restReq
+			}
+		} else {
+			result.ResponseErr = fmt.Errorf("Neighbor conf that has %v does not exist.", remoteAddr)
+			restReq.ResponseCh <- result
+			close(restReq.ResponseCh)
+		}
+
 	}
 }

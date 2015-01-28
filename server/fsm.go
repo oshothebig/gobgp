@@ -41,6 +41,13 @@ const (
 	HOLDTIME_OPENSENT = 240
 )
 
+type AdminState int
+
+const (
+	ADMIN_STATE_UP AdminState = iota
+	ADMIN_STATE_DOWN
+)
+
 type FSM struct {
 	globalConfig       *config.GlobalType
 	peerConfig         *config.NeighborType
@@ -51,6 +58,7 @@ type FSM struct {
 	idleHoldTime       float64
 	opensentHoldTime   float64
 	negotiatedHoldTime float64
+	adminState         AdminState
 }
 
 func (fsm *FSM) bgpMessageStateUpdate(MessageType uint8, isIn bool) {
@@ -102,6 +110,7 @@ func NewFSM(gConfig *config.GlobalType, pConfig *config.NeighborType, connCh cha
 		state:            bgp.BGP_FSM_IDLE,
 		passiveConnCh:    connCh,
 		opensentHoldTime: float64(HOLDTIME_OPENSENT),
+		adminState:       ADMIN_STATE_UP,
 	}
 }
 
@@ -137,14 +146,15 @@ func (fsm *FSM) sendNotification(conn net.Conn, code, subType uint8, data []byte
 }
 
 type FSMHandler struct {
-	t         tomb.Tomb
-	fsm       *FSM
-	conn      net.Conn
-	msgCh     chan *fsmMsg
-	errorCh   chan bool
-	incoming  chan *fsmMsg
-	outgoing  chan *bgp.BGPMessage
-	holdTimer *time.Timer
+	t             tomb.Tomb
+	fsm           *FSM
+	conn          net.Conn
+	msgCh         chan *fsmMsg
+	errorCh       chan bool
+	incoming      chan *fsmMsg
+	outgoing      chan *bgp.BGPMessage
+	holdTimer     *time.Timer
+	idleHoldTimer *time.Timer
 }
 
 func NewFSMHandler(fsm *FSM, incoming chan *fsmMsg, outgoing chan *bgp.BGPMessage) *FSMHandler {
@@ -175,7 +185,18 @@ func (h *FSMHandler) idle() bgp.FSMState {
 		fsm.keepaliveTicker = nil
 	}
 
-	idleHoldTimer := time.NewTimer(time.Second * time.Duration(fsm.idleHoldTime))
+	log.Debugf("fsm: idle hold time : %f", fsm.idleHoldTime)
+	h.idleHoldTimer = time.NewTimer(time.Second * time.Duration(fsm.idleHoldTime))
+
+	if fsm.adminState != ADMIN_STATE_UP {
+		if !h.idleHoldTimer.Stop() {
+			if len(h.idleHoldTimer.C) == 1 {
+				//drain
+				<-h.idleHoldTimer.C
+			}
+		}
+	}
+
 	for {
 		select {
 		case <-h.t.Dying():
@@ -186,7 +207,7 @@ func (h *FSMHandler) idle() bgp.FSMState {
 				"Topic": "Peer",
 				"Key":   fsm.peerConfig.NeighborAddress,
 			}).Warn("Closed an accepted connection")
-		case <-idleHoldTimer.C:
+		case <-h.idleHoldTimer.C:
 			log.WithFields(log.Fields{
 				"Topic":    "Peer",
 				"Key":      fsm.peerConfig.NeighborAddress,
@@ -205,6 +226,8 @@ func (h *FSMHandler) active() bgp.FSMState {
 		return 0
 	case conn := <-fsm.passiveConnCh:
 		fsm.passiveConn = conn
+	case <-h.errorCh:
+		return bgp.BGP_FSM_IDLE
 	}
 	// we don't implement delayed open timer so move to opensent right
 	// away.
@@ -570,4 +593,53 @@ func (h *FSMHandler) loop() error {
 		h.incoming <- e
 	}
 	return nil
+}
+
+func (h *FSMHandler) disable() {
+
+	if h.fsm.adminState == ADMIN_STATE_DOWN {
+		log.WithFields(log.Fields{
+			"Topic": "Peer",
+			"Key":   h.fsm.peerConfig.NeighborAddress,
+		}).Info("already down")
+		return
+	}
+
+	h.fsm.adminState = ADMIN_STATE_DOWN
+	log.WithFields(log.Fields{
+		"Topic": "Peer",
+		"Key":   h.fsm.peerConfig.NeighborAddress,
+	}).Info("Administrative shutdown")
+
+	if h.fsm.state == bgp.BGP_FSM_ESTABLISHED {
+		m := bgp.NewBGPNotificationMessage(
+			bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_ADMINISTRATIVE_SHUTDOWN, nil)
+		h.outgoing <- m
+		return
+	}
+	h.errorCh <- true
+
+	return
+}
+
+func (h *FSMHandler) enable() {
+
+	if h.fsm.adminState == ADMIN_STATE_UP {
+		log.WithFields(log.Fields{
+			"Topic": "Peer",
+			"Key":   h.fsm.peerConfig.NeighborAddress,
+		}).Info("already up")
+		return
+	}
+
+	h.fsm.adminState = ADMIN_STATE_UP
+	log.WithFields(log.Fields{
+		"Topic": "Peer",
+		"Key":   h.fsm.peerConfig.NeighborAddress,
+	}).Info("Administrative start")
+
+	//h.idleHoldTimer. = time.NewTimer(time.Second * time.Duration(h.fsm.idleHoldTime))
+	h.idleHoldTimer.Reset(time.Second * time.Duration(h.fsm.idleHoldTime))
+
+	return
 }

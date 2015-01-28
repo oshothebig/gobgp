@@ -199,7 +199,18 @@ func (peer *Peer) handleREST(restReq *api.RestRequest) {
 	result := &api.RestResponse{}
 	switch restReq.RequestType {
 	case api.REQ_LOCAL_RIB:
-		j, _ := json.Marshal(peer.rib.Tables[peer.rf])
+
+		var t table.Table
+		if peer.fsm.adminState == ADMIN_STATE_DOWN {
+			if peer.rf == bgp.RF_IPv4_UC {
+				t = table.NewIPv4Table(0)
+			} else {
+				t = table.NewIPv6Table(0)
+			}
+		} else {
+			t = peer.rib.Tables[peer.rf]
+		}
+		j, _ := json.Marshal(t)
 		result.Data = j
 	case api.REQ_NEIGHBOR_SHUTDOWN:
 		peer.outgoing <- bgp.NewBGPNotificationMessage(bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_ADMINISTRATIVE_SHUTDOWN, nil)
@@ -215,9 +226,7 @@ func (peer *Peer) handleREST(restReq *api.RestRequest) {
 	case api.REQ_NEIGHBOR_SOFT_RESET_OUT:
 		pathList := peer.adjRib.GetOutPathList(peer.rf)
 		peer.sendMessages(table.CreateUpdateMsgFromPaths(pathList))
-	case api.REQ_ADJ_RIB_IN:
-		fallthrough
-	case api.REQ_ADJ_RIB_OUT:
+	case api.REQ_ADJ_RIB_IN, api.REQ_ADJ_RIB_OUT:
 		rfs := []bgp.RouteFamily{bgp.RF_IPv4_UC, bgp.RF_IPv6_UC}
 		adjrib := make(map[string][]table.Path)
 
@@ -255,6 +264,7 @@ func (peer *Peer) sendUpdateMsgFromPaths(pList []table.Path, wList []table.Path)
 }
 
 func (peer *Peer) handlePeerMsg(m *peerMsg) {
+
 	switch m.msgType {
 	case PEER_MSG_PATH:
 		pList, wList, _ := peer.rib.ProcessPaths(m.msgData.([]table.Path))
@@ -265,7 +275,7 @@ func (peer *Peer) handlePeerMsg(m *peerMsg) {
 	}
 }
 
-func (peer *Peer) handleServerMsg(m *serverMsg) {
+func (peer *Peer) handleServerMsg(m *serverMsg, h *FSMHandler) {
 	switch m.msgType {
 	case SRV_MSG_PEER_ADDED:
 		d := m.msgData.(*serverMsgDataPeer)
@@ -294,6 +304,14 @@ func (peer *Peer) handleServerMsg(m *serverMsg) {
 		} else {
 			log.Warning("can not find peer: ", d.Address.String())
 		}
+	case SRV_MSG_PEER_UP:
+		// enable peer
+		h.enable()
+
+	case SRV_MSG_PEER_SHUTDOWN:
+		// disable peer
+		h.disable()
+
 	case SRV_MSG_API:
 		peer.handleREST(m.msgData.(*api.RestRequest))
 	default:
@@ -352,6 +370,11 @@ func (peer *Peer) loop() error {
 							s.peerMsgCh <- pm
 						}
 					}
+					// clear counter
+					if h.fsm.adminState == ADMIN_STATE_DOWN {
+						h.fsm.peerConfig.BgpNeighborCommonState = config.BgpNeighborCommonStateType{}
+					}
+
 				case FSM_MSG_BGP_MESSAGE:
 					switch m := e.MsgData.(type) {
 					case *bgp.MessageError:
@@ -367,7 +390,7 @@ func (peer *Peer) loop() error {
 					}
 				}
 			case m := <-peer.serverMsgCh:
-				peer.handleServerMsg(m)
+				peer.handleServerMsg(m, h)
 			case m := <-peer.peerMsgCh:
 				peer.handlePeerMsg(m)
 			}
